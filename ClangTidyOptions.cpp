@@ -67,15 +67,12 @@ template <> struct MappingTraits<ClangTidyOptions::StringPair> {
 
 struct NOptionMap {
   NOptionMap(IO &) {}
-  NOptionMap(IO &, const ClangTidyOptions::OptionMap &OptionMap) {
-    Options.reserve(OptionMap.size());
-    for (const auto &KeyValue : OptionMap)
-      Options.emplace_back(std::string(KeyValue.getKey()), KeyValue.getValue().Value);
-  }
+  NOptionMap(IO &, const ClangTidyOptions::OptionMap &OptionMap)
+      : Options(OptionMap.begin(), OptionMap.end()) {}
   ClangTidyOptions::OptionMap denormalize(IO &) {
     ClangTidyOptions::OptionMap Map;
     for (const auto &KeyValue : Options)
-      Map[KeyValue.first] = ClangTidyOptions::ClangTidyValue(KeyValue.second);
+      Map[KeyValue.first] = KeyValue.second;
     return Map;
   }
   std::vector<ClangTidyOptions::StringPair> Options;
@@ -95,8 +92,6 @@ template <> struct MappingTraits<ClangTidyOptions> {
     IO.mapOptional("CheckOptions", NOpts->Options);
     IO.mapOptional("ExtraArgs", Options.ExtraArgs);
     IO.mapOptional("ExtraArgsBefore", Options.ExtraArgsBefore);
-    IO.mapOptional("InheritParentConfig", Options.InheritParentConfig);
-    IO.mapOptional("UseColor", Options.UseColor);
   }
 };
 
@@ -114,9 +109,10 @@ ClangTidyOptions ClangTidyOptions::getDefaults() {
   Options.SystemHeaders = false;
   Options.FormatStyle = "none";
   Options.User = llvm::None;
-  for (const ClangTidyModuleRegistry::entry &Module :
-       ClangTidyModuleRegistry::entries())
-    Options = Options.mergeWith(Module.instantiate()->getModuleOptions(), 0);
+  for (ClangTidyModuleRegistry::iterator I = ClangTidyModuleRegistry::begin(),
+                                         E = ClangTidyModuleRegistry::end();
+       I != E; ++I)
+    Options = Options.mergeWith(I->instantiate()->getModuleOptions());
   return Options;
 }
 
@@ -142,8 +138,8 @@ static void overrideValue(Optional<T> &Dest, const Optional<T> &Src) {
     Dest = Src;
 }
 
-ClangTidyOptions ClangTidyOptions::mergeWith(const ClangTidyOptions &Other,
-                                             unsigned Priority) const {
+ClangTidyOptions
+ClangTidyOptions::mergeWith(const ClangTidyOptions &Other) const {
   ClangTidyOptions Result = *this;
 
   mergeCommaSeparatedLists(Result.Checks, Other.Checks);
@@ -152,16 +148,11 @@ ClangTidyOptions ClangTidyOptions::mergeWith(const ClangTidyOptions &Other,
   overrideValue(Result.SystemHeaders, Other.SystemHeaders);
   overrideValue(Result.FormatStyle, Other.FormatStyle);
   overrideValue(Result.User, Other.User);
-  overrideValue(Result.UseColor, Other.UseColor);
   mergeVectors(Result.ExtraArgs, Other.ExtraArgs);
   mergeVectors(Result.ExtraArgsBefore, Other.ExtraArgsBefore);
 
-  for (const auto &KeyValue : Other.CheckOptions) {
-    Result.CheckOptions.insert_or_assign(
-        KeyValue.getKey(),
-        ClangTidyValue(KeyValue.getValue().Value,
-                       KeyValue.getValue().Priority + Priority));
-  }
+  for (const auto &KeyValue : Other.CheckOptions)
+    Result.CheckOptions[KeyValue.first] = KeyValue.second;
 
   return Result;
 }
@@ -177,9 +168,8 @@ const char
 ClangTidyOptions
 ClangTidyOptionsProvider::getOptions(llvm::StringRef FileName) {
   ClangTidyOptions Result;
-  unsigned Priority = 0;
   for (const auto &Source : getRawOptions(FileName))
-    Result = Result.mergeWith(Source.first, ++Priority);
+    Result = Result.mergeWith(Source.first);
   return Result;
 }
 
@@ -194,27 +184,14 @@ ConfigOptionsProvider::ConfigOptionsProvider(
     const ClangTidyGlobalOptions &GlobalOptions,
     const ClangTidyOptions &DefaultOptions,
     const ClangTidyOptions &ConfigOptions,
-    const ClangTidyOptions &OverrideOptions,
-    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS)
-    : FileOptionsBaseProvider(GlobalOptions, DefaultOptions, OverrideOptions,
-                              FS),
-      ConfigOptions(ConfigOptions) {}
+    const ClangTidyOptions &OverrideOptions)
+    : DefaultOptionsProvider(GlobalOptions, DefaultOptions),
+      ConfigOptions(ConfigOptions), OverrideOptions(OverrideOptions) {}
 
 std::vector<OptionsSource>
 ConfigOptionsProvider::getRawOptions(llvm::StringRef FileName) {
   std::vector<OptionsSource> RawOptions =
       DefaultOptionsProvider::getRawOptions(FileName);
-  if (ConfigOptions.InheritParentConfig.getValueOr(false)) {
-    LLVM_DEBUG(llvm::dbgs()
-               << "Getting options for file " << FileName << "...\n");
-    assert(FS && "FS must be set.");
-
-    llvm::SmallString<128> AbsoluteFilePath(FileName);
-
-    if (!FS->makeAbsolute(AbsoluteFilePath)) {
-      addRawFileOptions(AbsoluteFilePath, RawOptions);
-    }
-  }
   RawOptions.emplace_back(ConfigOptions,
                           OptionsSourceTypeConfigCommandLineOption);
   RawOptions.emplace_back(OverrideOptions,
@@ -222,7 +199,7 @@ ConfigOptionsProvider::getRawOptions(llvm::StringRef FileName) {
   return RawOptions;
 }
 
-FileOptionsBaseProvider::FileOptionsBaseProvider(
+FileOptionsProvider::FileOptionsProvider(
     const ClangTidyGlobalOptions &GlobalOptions,
     const ClangTidyOptions &DefaultOptions,
     const ClangTidyOptions &OverrideOptions,
@@ -234,68 +211,13 @@ FileOptionsBaseProvider::FileOptionsBaseProvider(
   ConfigHandlers.emplace_back(".clang-tidy", parseConfiguration);
 }
 
-FileOptionsBaseProvider::FileOptionsBaseProvider(
+FileOptionsProvider::FileOptionsProvider(
     const ClangTidyGlobalOptions &GlobalOptions,
     const ClangTidyOptions &DefaultOptions,
     const ClangTidyOptions &OverrideOptions,
-    const FileOptionsBaseProvider::ConfigFileHandlers &ConfigHandlers)
+    const FileOptionsProvider::ConfigFileHandlers &ConfigHandlers)
     : DefaultOptionsProvider(GlobalOptions, DefaultOptions),
       OverrideOptions(OverrideOptions), ConfigHandlers(ConfigHandlers) {}
-
-void FileOptionsBaseProvider::addRawFileOptions(
-    llvm::StringRef AbsolutePath, std::vector<OptionsSource> &CurOptions) {
-  auto CurSize = CurOptions.size();
-
-  // Look for a suitable configuration file in all parent directories of the
-  // file. Start with the immediate parent directory and move up.
-  StringRef Path = llvm::sys::path::parent_path(AbsolutePath);
-  for (StringRef CurrentPath = Path; !CurrentPath.empty();
-       CurrentPath = llvm::sys::path::parent_path(CurrentPath)) {
-    llvm::Optional<OptionsSource> Result;
-
-    auto Iter = CachedOptions.find(CurrentPath);
-    if (Iter != CachedOptions.end())
-      Result = Iter->second;
-
-    if (!Result)
-      Result = tryReadConfigFile(CurrentPath);
-
-    if (Result) {
-      // Store cached value for all intermediate directories.
-      while (Path != CurrentPath) {
-        LLVM_DEBUG(llvm::dbgs()
-                   << "Caching configuration for path " << Path << ".\n");
-        if (!CachedOptions.count(Path))
-          CachedOptions[Path] = *Result;
-        Path = llvm::sys::path::parent_path(Path);
-      }
-      CachedOptions[Path] = *Result;
-
-      CurOptions.push_back(*Result);
-      if (!Result->first.InheritParentConfig.getValueOr(false))
-        break;
-    }
-  }
-  // Reverse order of file configs because closer configs should have higher
-  // priority.
-  std::reverse(CurOptions.begin() + CurSize, CurOptions.end());
-}
-
-FileOptionsProvider::FileOptionsProvider(
-    const ClangTidyGlobalOptions &GlobalOptions,
-    const ClangTidyOptions &DefaultOptions,
-    const ClangTidyOptions &OverrideOptions,
-    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS)
-    : FileOptionsBaseProvider(GlobalOptions, DefaultOptions, OverrideOptions,
-                              VFS){}
-
-FileOptionsProvider::FileOptionsProvider(
-    const ClangTidyGlobalOptions &GlobalOptions,
-    const ClangTidyOptions &DefaultOptions,
-    const ClangTidyOptions &OverrideOptions,
-    const FileOptionsBaseProvider::ConfigFileHandlers &ConfigHandlers)
-    : FileOptionsBaseProvider(GlobalOptions, DefaultOptions, OverrideOptions,
-                              ConfigHandlers) {}
 
 // FIXME: This method has some common logic with clang::format::getStyle().
 // Consider pulling out common bits to a findParentFileWithName function or
@@ -313,16 +235,42 @@ FileOptionsProvider::getRawOptions(StringRef FileName) {
 
   std::vector<OptionsSource> RawOptions =
       DefaultOptionsProvider::getRawOptions(AbsoluteFilePath.str());
-  addRawFileOptions(AbsoluteFilePath, RawOptions);
   OptionsSource CommandLineOptions(OverrideOptions,
                                    OptionsSourceTypeCheckCommandLineOption);
+  // Look for a suitable configuration file in all parent directories of the
+  // file. Start with the immediate parent directory and move up.
+  StringRef Path = llvm::sys::path::parent_path(AbsoluteFilePath.str());
+  for (StringRef CurrentPath = Path; !CurrentPath.empty();
+       CurrentPath = llvm::sys::path::parent_path(CurrentPath)) {
+    llvm::Optional<OptionsSource> Result;
 
+    auto Iter = CachedOptions.find(CurrentPath);
+    if (Iter != CachedOptions.end())
+      Result = Iter->second;
+
+    if (!Result)
+      Result = tryReadConfigFile(CurrentPath);
+
+    if (Result) {
+      // Store cached value for all intermediate directories.
+      while (Path != CurrentPath) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "Caching configuration for path " << Path << ".\n");
+        CachedOptions[Path] = *Result;
+        Path = llvm::sys::path::parent_path(Path);
+      }
+      CachedOptions[Path] = *Result;
+
+      RawOptions.push_back(*Result);
+      break;
+    }
+  }
   RawOptions.push_back(CommandLineOptions);
   return RawOptions;
 }
 
 llvm::Optional<OptionsSource>
-FileOptionsBaseProvider::tryReadConfigFile(StringRef Directory) {
+FileOptionsProvider::tryReadConfigFile(StringRef Directory) {
   assert(!Directory.empty());
 
   if (!llvm::sys::fs::is_directory(Directory)) {

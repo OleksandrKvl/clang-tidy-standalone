@@ -9,19 +9,16 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_TIDY_CLANGTIDYMODULE_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_TIDY_CLANGTIDYMODULE_H
 
-#include "ClangTidyOptions.h"
-#include "llvm/ADT/StringMap.h"
+#include "ClangTidy.h"
 #include "llvm/ADT/StringRef.h"
 #include <functional>
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace clang {
 namespace tidy {
-
-class ClangTidyCheck;
-class ClangTidyContext;
 
 /// A collection of \c ClangTidyCheckFactory instances.
 ///
@@ -30,12 +27,12 @@ class ClangTidyContext;
 class ClangTidyCheckFactories {
 public:
   using CheckFactory = std::function<std::unique_ptr<ClangTidyCheck>(
-      llvm::StringRef Name, ClangTidyContext *Context)>;
+      StringRef Name, ClangTidyContext *Context)>;
 
   /// Registers check \p Factory with name \p Name.
   ///
   /// For all checks that have default constructors, use \c registerCheck.
-  void registerCheckFactory(llvm::StringRef Name, CheckFactory Factory);
+  void registerCheckFactory(StringRef Name, CheckFactory Factory);
 
   /// Registers the \c CheckType with the name \p Name.
   ///
@@ -58,9 +55,9 @@ public:
   ///   }
   /// };
   /// \endcode
-  template <typename CheckType> void registerCheck(llvm::StringRef CheckName) {
+  template <typename CheckType> void registerCheck(StringRef CheckName) {
     registerCheckFactory(CheckName,
-                         [](llvm::StringRef Name, ClangTidyContext *Context) {
+                         [](StringRef Name, ClangTidyContext *Context) {
                            return std::make_unique<CheckType>(Name, Context);
                          });
   }
@@ -69,7 +66,7 @@ public:
   std::vector<std::unique_ptr<ClangTidyCheck>>
   createChecks(ClangTidyContext *Context);
 
-  typedef llvm::StringMap<CheckFactory> FactoryMap;
+  typedef std::map<std::string, CheckFactory> FactoryMap;
   FactoryMap::const_iterator begin() const { return Factories.begin(); }
   FactoryMap::const_iterator end() const { return Factories.end(); }
   bool empty() const { return Factories.empty(); }
