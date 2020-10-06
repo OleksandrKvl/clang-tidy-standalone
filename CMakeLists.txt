@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.13.4)
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR}/cmake)
 include("clang_wrapper")
 
-find_package(LLVM REQUIRED CONFIG)
+find_package(LLVM 10.0.0 EXACT REQUIRED CONFIG)
 
 include_directories("${LLVM_INCLUDE_DIRS}")
 link_directories("${LLVM_LIBRARY_DIRS}")
