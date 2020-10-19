@@ -2,7 +2,11 @@ project(clang-tidy-standalone)
 cmake_minimum_required(VERSION 3.13.4)
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR}/cmake)
-include("clang_wrapper")
+include(clang_wrapper)
+include(utils)
+
+in_source_build_guard()
+set_default_build_type(Debug)
 
 find_package(LLVM 10.0.0 EXACT REQUIRED CONFIG)
 
